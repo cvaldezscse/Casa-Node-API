@@ -4,17 +4,16 @@
 
 /* eslint-disable id-length, max-lines, max-statements */
 
-const logger = require('utils/logger.js');
-var LndError = require('models/errors.js').LndError;
-
-const diskLogic = require('logic/disk');
-const bitcoindLogic = require('logic/bitcoind.js');
-const constants = require('utils/const.js');
+const LndError = require('models/errors.js').LndError;
+const NodeError = require('models/errors.js').NodeError;
 
 const lndService = require('services/lnd.js');
+const diskLogic = require('logic/disk');
+const bitcoindLogic = require('logic/bitcoind.js');
 
-const SEND_COINS_WHEN_AVAILABLE_INTERVAL_IN_SECONDS = 30;
-const MILLI_SECONDS = 1000;
+const constants = require('utils/const.js');
+const convert = require('utils/convert.js');
+
 const UNIMPLEMENTED_CODE = 12;
 
 const PENDING_OPEN_CHANNELS = 'pendingOpenChannels';
@@ -28,13 +27,25 @@ const MAINNET_GENESIS_BLOCK_TIMESTAMP = 1231035305;
 const TESTNET_GENESIS_BLOCK_TIMESTAMP = 1296717402;
 
 const FAST_BLOCK_CONF_TARGET = 1;
-const NORMAL_BLOCK_CONF_TARGET = 2;
-const SLOW_BLOCK_CONF_TARGET = 5;
-const CHEAPEST_BLOCK_CONF_TARGET = 100;
+const NORMAL_BLOCK_CONF_TARGET = 6;
+const SLOW_BLOCK_CONF_TARGET = 24;
+const CHEAPEST_BLOCK_CONF_TARGET = 144;
+
+const OPEN_CHANNEL_EXTRA_WEIGHT = 10;
+
+const FEE_RATE_TOO_LOW_ERROR = {
+  code: 'FEE_RATE_TOO_LOW',
+  text: 'Mempool reject low fee transaction. Increase fee rate.',
+};
 
 const INSUFFICIENT_FUNDS_ERROR = {
   code: 'INSUFFICIENT_FUNDS',
   text: 'Lower amount or increase confirmation target.'
+};
+
+const INVALID_ADDRESS = {
+  code: 'INVALID_ADDRESS',
+  text: 'Please validate the Bitcoin address is correct.'
 };
 
 const OUTPUT_IS_DUST_ERROR = {
@@ -42,9 +53,22 @@ const OUTPUT_IS_DUST_ERROR = {
   text: 'Transaction output is dust.'
 };
 
+// Converts a byte object into a hex string.
+function toHexString(byteObject) {
+  const bytes = Object.values(byteObject);
+
+  return bytes.map(function(byte) {
+
+    return ('00' + (byte & 0xFF).toString(16)).slice(-2); // eslint-disable-line no-magic-numbers
+  }).join('');
+}
+
 // Creates a new invoice; more commonly known as a payment request.
-function addInvoice(amt, memo) {
-  return lndService.addInvoice(amt, memo);
+async function addInvoice(amt, memo) {
+  const invoice = await lndService.addInvoice(amt, memo);
+  invoice.rHashStr = toHexString(invoice.rHash);
+
+  return invoice;
 }
 
 // Creates a new managed channel.
@@ -61,9 +85,9 @@ async function addManagedChannel(channelPoint, name, purpose) {
   await setManagedChannels(managedChannels);
 }
 
-// Cancels any existing send coins loops.
-function cancelSendCoinsWhenAvailable() {
-  return setPendingCoins(false, {});
+// Change your lnd password. Wallet must exist and be unlocked.
+async function changePassword(currentPassword, newPassword) {
+  return await lndService.changePassword(currentPassword, newPassword);
 }
 
 // Closes the channel that corresponds to the given channelPoint. Force close is optional.
@@ -76,86 +100,155 @@ function decodePaymentRequest(paymentRequest) {
   return lndService.decodePaymentRequest(paymentRequest);
 }
 
+// Estimate the cost of opening a channel. We do this by repurposing the existing estimateFee grpc route from lnd. We
+// generate our own unused address and then feed that into the existing call. Then we add an extra 10 sats per
+// feerateSatPerByte. This is because the actual cost is slightly more than the default one output estimate.
+async function estimateChannelOpenFee(amt, confTarget) {
+  const address = (await generateAddress()).address;
+  const baseFeeEstimate = await estimateFee(address, amt, confTarget, false);
+
+  if (confTarget === 0) {
+    const keys = Object.keys(baseFeeEstimate);
+
+    for (const key of keys) {
+
+      if (baseFeeEstimate[key].feeSat) {
+        baseFeeEstimate[key].feeSat = String(parseInt(baseFeeEstimate[key].feeSat, 10) + OPEN_CHANNEL_EXTRA_WEIGHT
+          * baseFeeEstimate[key].feerateSatPerByte);
+      }
+
+    }
+
+  } else if (baseFeeEstimate.feeSat) {
+    baseFeeEstimate.feeSat = String(parseInt(baseFeeEstimate.feeSat, 10) + OPEN_CHANNEL_EXTRA_WEIGHT
+      * baseFeeEstimate.feerateSatPerByte);
+  }
+
+  return baseFeeEstimate;
+}
+
 // Estimate an on chain transaction fee.
 async function estimateFee(address, amt, confTarget, sweep) {
+  const mempoolInfo = (await bitcoindLogic.getMempoolInfo()).result;
 
   if (sweep) {
 
-    const utxos = (await lndService.listUnspent()).utxos;
-    const balance = parseInt((await lndService.getWalletBalance()).totalBalance, 10);
+    const balance = parseInt((await lndService.getWalletBalance()).confirmedBalance, 10);
+    const amtToEstimate = balance;
 
-    utxos.sort(compareUtxo);
-
-    var amtToEstimate = balance + 1;
-
-    // We start to estimate a fee by forcing the estimate amount to use the maximum amount of utxos. If that fails, we
-    // subtract the next smallest utxo until we run out of utxos. If we run out of utxos, that means we are unable to
-    // create a transaction for the given confirmation target.
-    for (const utxo of utxos) {
-      amtToEstimate -= utxo.amountSat;
-
-      try {
-        if (confTarget === 0) {
-          return await estimateFeeGroup(address, amtToEstimate);
-        } else {
-          return await lndService.estimateFee(address, amtToEstimate, confTarget);
-        }
-      } catch (error) {
-        // no op
-      }
+    if (confTarget === 0) {
+      return await estimateFeeGroupSweep(address, amtToEstimate, mempoolInfo.mempoolminfee);
     }
 
-    return INSUFFICIENT_FUNDS_ERROR;
+    return await estimateFeeSweep(address, amtToEstimate, mempoolInfo.mempoolminfee, confTarget, 0, amtToEstimate);
   } else {
 
     try {
       if (confTarget === 0) {
-        return await estimateFeeGroup(address, amt);
-      } else {
-        return await lndService.estimateFee(address, amt, confTarget);
-      }
-    } catch (error) {
-      if (error.error.details === 'transaction output is dust') {
-        return OUTPUT_IS_DUST_ERROR;
+        return await estimateFeeGroup(address, amt, mempoolInfo.mempoolminfee);
       }
 
-      return INSUFFICIENT_FUNDS_ERROR;
+      return await estimateFeeWrapper(address, amt, mempoolInfo.mempoolminfee, confTarget);
+    } catch (error) {
+      return handleEstimateFeeError(error);
     }
   }
 }
 
+// Use binary search strategy to determine the largest amount that can be sent.
+async function estimateFeeSweep(address, fullAmtToEstimate, mempoolMinFee, confTarget, l, r) {
 
-async function estimateFeeGroup(address, amt) {
-  const calls = [lndService.estimateFee(address, amt, FAST_BLOCK_CONF_TARGET),
-    lndService.estimateFee(address, amt, NORMAL_BLOCK_CONF_TARGET),
-    lndService.estimateFee(address, amt, SLOW_BLOCK_CONF_TARGET),
-    lndService.estimateFee(address, amt, CHEAPEST_BLOCK_CONF_TARGET),
+  const amtToEstimate = l + Math.floor((r - l) / 2); // eslint-disable-line no-magic-numbers
+
+  try {
+    const successfulEstimate = await lndService.estimateFee(address, amtToEstimate, confTarget);
+
+    // Return after we have completed our search.
+    if (l === amtToEstimate) {
+      successfulEstimate.sweepAmount = amtToEstimate;
+
+      if (successfulEstimate.feeSat < convert(mempoolMinFee, 'btc', 'sat', 'Number')) {
+        throw new NodeError('FEE_RATE_TOO_LOW');
+      }
+
+      return successfulEstimate;
+    }
+
+    return await estimateFeeSweep(address, fullAmtToEstimate, mempoolMinFee, confTarget, amtToEstimate, r);
+
+  } catch (error) {
+
+    // Return after we have completed our search.
+    if (l === amtToEstimate) {
+      return handleEstimateFeeError(error);
+    }
+
+    return await estimateFeeSweep(address, fullAmtToEstimate, mempoolMinFee, confTarget, l, amtToEstimate);
+  }
+}
+
+async function estimateFeeGroupSweep(address, amt, mempoolMinFee) {
+  const calls = [estimateFeeSweep(address, amt, mempoolMinFee, FAST_BLOCK_CONF_TARGET, 0, amt),
+    estimateFeeSweep(address, amt, mempoolMinFee, NORMAL_BLOCK_CONF_TARGET, 0, amt),
+    estimateFeeSweep(address, amt, mempoolMinFee, SLOW_BLOCK_CONF_TARGET, 0, amt),
+    estimateFeeSweep(address, amt, mempoolMinFee, CHEAPEST_BLOCK_CONF_TARGET, 0, amt),
   ];
 
-  const [fast, normal, slow, cheapest] = await Promise.all(calls.map(p => p.catch(() => INSUFFICIENT_FUNDS_ERROR)));
+  const [fast, normal, slow, cheapest]
+    = await Promise.all(calls.map(p => p.catch(error => handleEstimateFeeError(error))));
 
   return {
-    fast: fast,
-    normal: normal,
-    slow: slow,
-    cheapest: cheapest
+    fast: fast, // eslint-disable-line object-shorthand
+    normal: normal, // eslint-disable-line object-shorthand
+    slow: slow, // eslint-disable-line object-shorthand
+    cheapest: cheapest, // eslint-disable-line object-shorthand
   };
 }
 
-function compareUtxo(a, b) {
-  if (parseInt(a.amountSat, 10) < parseInt(b.amountSat, 10)) {
-    return -1;
-  }
-  if (parseInt(a.amountSat, 10) > parseInt(b.amountSat, 10)) {
-    return 1;
+async function estimateFeeWrapper(address, amt, mempoolMinFee, confTarget) {
+  const estimate = await lndService.estimateFee(address, amt, confTarget);
+
+  if (estimate.feeSat < convert(mempoolMinFee, 'btc', 'sat', 'Number')) {
+    throw new NodeError('FEE_RATE_TOO_LOW');
   }
 
-  return 0;
+  return estimate;
+}
+
+async function estimateFeeGroup(address, amt, mempoolMinFee) {
+  const calls = [estimateFeeWrapper(address, amt, mempoolMinFee, FAST_BLOCK_CONF_TARGET),
+    estimateFeeWrapper(address, amt, mempoolMinFee, NORMAL_BLOCK_CONF_TARGET),
+    estimateFeeWrapper(address, amt, mempoolMinFee, SLOW_BLOCK_CONF_TARGET),
+    estimateFeeWrapper(address, amt, mempoolMinFee, CHEAPEST_BLOCK_CONF_TARGET),
+  ];
+
+  const [fast, normal, slow, cheapest]
+    = await Promise.all(calls.map(p => p.catch(error => handleEstimateFeeError(error))));
+
+  return {
+    fast: fast, // eslint-disable-line object-shorthand
+    normal: normal, // eslint-disable-line object-shorthand
+    slow: slow, // eslint-disable-line object-shorthand
+    cheapest: cheapest, // eslint-disable-line object-shorthand
+  };
+}
+
+function handleEstimateFeeError(error) {
+
+  if (error.message === 'FEE_RATE_TOO_LOW') {
+    return FEE_RATE_TOO_LOW_ERROR;
+  } else if (error.error.details === 'transaction output is dust') {
+    return OUTPUT_IS_DUST_ERROR;
+  } else if (error.error.details === 'insufficient funds available to construct transaction') {
+    return INSUFFICIENT_FUNDS_ERROR;
+  }
+
+  return INVALID_ADDRESS;
 }
 
 // Generates a new on chain segwit bitcoin address.
-function generateAddress() {
-  return lndService.generateAddress();
+async function generateAddress() {
+  return await lndService.generateAddress();
 }
 
 // Generates a new 24 word seed phrase.
@@ -169,7 +262,7 @@ async function generateSeed() {
     return {seed: response.cipherSeedMnemonic};
   }
 
-  throw new LndError('Lnd is not operational, therefor a seed cannot be created.');
+  throw new LndError('Lnd is not operational, therefore a seed cannot be created.');
 }
 
 // Returns the total funds in channels and the total pending funds in channels.
@@ -181,6 +274,11 @@ function getChannelBalance() {
 function getChannelCount() {
   return lndService.getOpenChannels()
     .then(response => ({count: response.length}));
+}
+
+function getChannelPolicy() {
+  return lndService.getFeeReport()
+    .then(feeReport => feeReport.channelFees);
 }
 
 function getForwardingEvents(startTime, endTime, indexOffset) {
@@ -212,10 +310,14 @@ async function getOnChainTransactions() {
   const closedChannels = await lndService.getClosedChannels();
   const pendingChannelRPC = await lndService.getPendingChannels();
 
-  const pendingChannelTransactions = [];
+  const pendingOpeningChannelTransactions = [];
+  for (const pendingChannel of pendingChannelRPC.pendingOpenChannels) {
+    const pendingTransaction = pendingChannel.channel.channelPoint.split(':').shift();
+    pendingOpeningChannelTransactions.push(pendingTransaction);
+  }
 
+  const pendingClosingChannelTransactions = [];
   for (const pendingGroup of [
-    pendingChannelRPC.pendingOpenChannels,
     pendingChannelRPC.pendingClosingChannels,
     pendingChannelRPC.pendingForceClosingChannels,
     pendingChannelRPC.waitingCloseChannels]) {
@@ -224,37 +326,47 @@ async function getOnChainTransactions() {
       continue;
     }
     for (const pendingChannel of pendingGroup) {
-      const pendingTransaction = pendingChannel.channel.channelPoint.split(':').shift();
-      pendingChannelTransactions.push(pendingTransaction);
+      pendingClosingChannelTransactions.push(pendingChannel.closingTxid);
     }
   }
 
-  const openingChannelTransactions = [];
+  const openChannelTransactions = [];
   for (const channel of openChannels) {
-    const openingTransaction = channel.channelPoint.split(':').shift();
-    openingChannelTransactions.push(openingTransaction);
+    const openTransaction = channel.channelPoint.split(':').shift();
+    openChannelTransactions.push(openTransaction);
   }
 
-  const closingChannelTransactions = [];
+  const closedChannelTransactions = [];
   for (const channel of closedChannels) {
-    const closingTransaction = channel.channelPoint.split(':').shift();
-    closingChannelTransactions.push(closingTransaction);
+    const closedTransaction = channel.closingTxHash.split(':').shift();
+    closedChannelTransactions.push(closedTransaction);
+
+    const openTransaction = channel.channelPoint.split(':').shift();
+    openChannelTransactions.push(openTransaction);
   }
 
   const reversedTransactions = [];
   for (const transaction of transactions) {
     const txHash = transaction.txHash;
 
-    if (openingChannelTransactions.includes(txHash)) {
+    if (openChannelTransactions.includes(txHash)) {
       transaction.type = 'CHANNEL_OPEN';
-    } else if (closingChannelTransactions.includes(txHash)) {
+    } else if (closedChannelTransactions.includes(txHash)) {
       transaction.type = 'CHANNEL_CLOSE';
-    } else if (pendingChannelTransactions.includes(txHash)) {
-      transaction.type = 'CHANNEL_PENDING';
+    } else if (pendingOpeningChannelTransactions.includes(txHash)) {
+      transaction.type = 'PENDING_OPEN';
+    } else if (pendingClosingChannelTransactions.includes(txHash)) {
+      transaction.type = 'PENDING_CLOSE';
     } else if (transaction.amount < 0) {
       transaction.type = 'ON_CHAIN_TRANSACTION_SENT';
-    } else if (transaction.amount > 0) {
+    } else if (transaction.amount > 0 && transaction.destAddresses.length > 0) {
       transaction.type = 'ON_CHAIN_TRANSACTION_RECEIVED';
+
+    // Positive amounts are either incoming transactions or a WaitingCloseChannel. There is no way to determine which
+    // until the transaction has at least one confirmation. Then a WaitingCloseChannel will become a pending Closing
+    // channel and will have an associated tx id.
+    } else if (transaction.amount > 0 && transaction.destAddresses.length === 0) {
+      transaction.type = 'PENDING_CLOSE';
     } else {
       transaction.type = 'UNKNOWN';
     }
@@ -303,6 +415,15 @@ const getChannels = async() => {
       channel.initiator = false;
     }
 
+    // Include commitFee in balance. This helps us avoid the leaky sats issue by making balances more consistent.
+    if (channel.initiator) {
+      channel.channel.localBalance
+        = String(parseInt(channel.channel.localBalance, 10) + parseInt(channel.commitFee, 10));
+    } else {
+      channel.channel.remoteBalance
+        = String(parseInt(channel.channel.remoteBalance, 10) + parseInt(channel.commitFee, 10));
+    }
+
     allChannels.push(channel);
   }
 
@@ -320,6 +441,16 @@ const getChannels = async() => {
 
   for (const channel of openChannels) {
     channel.type = 'OPEN';
+
+    // Include commitFee in balance. This helps us avoid the leaky sats issue by making balances more consistent.
+    if (channel.initiator) {
+      channel.localBalance
+        = String(parseInt(channel.localBalance, 10) + parseInt(channel.commitFee, 10));
+    } else {
+      channel.remoteBalance
+        = String(parseInt(channel.remoteBalance, 10) + parseInt(channel.commitFee, 10));
+    }
+
     allChannels.push(channel);
   }
 
@@ -500,7 +631,7 @@ async function initializeWallet(password, seed) {
     return;
   }
 
-  throw new LndError('Lnd is not operational, therefor a wallet cannot be created.');
+  throw new LndError('Lnd is not operational, therefore a wallet cannot be created.');
 }
 
 // Opens a channel to the node with the given public key with the given amount.
@@ -584,31 +715,6 @@ function setManagedChannels(managedChannelsObject) {
   return diskLogic.writeManagedChannelsFile(managedChannelsObject);
 }
 
-async function attemptSendCoins() {
-  const pendingSendCoins = await getPendingSendCoins();
-  if (!pendingSendCoins.active) {
-    return;
-  }
-
-  try {
-    await lndService
-      .sendCoins(pendingSendCoins.data.addr, pendingSendCoins.data.amt, pendingSendCoins.data.satPerByte);
-    await setPendingCoins(false, {});
-  } catch (error) {
-    // TODO this may need more attention - will try indefinitely
-    logger.error('Unable to send funds', 'transaction', error);
-    setTimeout(attemptSendCoins, SEND_COINS_WHEN_AVAILABLE_INTERVAL_IN_SECONDS * MILLI_SECONDS);
-  }
-}
-
-// Sets the current state of pending coins and begins the send coins loop.
-function setPendingCoins(active, data) {
-  return diskLogic.writePendingSendCoinsFile({active, data})
-    .then(() => {
-      attemptSendCoins(); // Don't chain/wait this promise, it's designed to run and loop in the background
-    });
-}
-
 // Returns if lnd is operation and if the wallet is unlocked.
 async function getStatus() {
   const bitcoindStatus = await bitcoindLogic.getStatus();
@@ -659,28 +765,6 @@ async function getStatus() {
   }
 }
 
-//  Returns pending send coins object.
-function getPendingSendCoins() {
-  return diskLogic.readPendingSendCoinsFile();
-}
-
-// Create a loop that tries to send coins to a specified address every time interval. This loop will remain until
-// send coins has completed successfully or when canceled.
-async function sendCoinsWhenAvailable(addr, amt, satPerByte) {
-  const pendingSendCoins = await getPendingSendCoins();
-
-  if (pendingSendCoins.active) {
-    throw new LndError(
-      'There is already a withdraw in progress. Please cancel it or wait for it to complete.',
-      'WITHDRAW_ALREADY_IN_PROGRESS');
-  }
-  await setPendingCoins(true, {
-    addr: addr, // eslint-disable-line object-shorthand
-    amt: amt, // eslint-disable-line object-shorthand
-    satPerByte: satPerByte // eslint-disable-line object-shorthand
-  });
-}
-
 // Unlock and existing wallet.
 async function unlockWallet(password) {
   const lndStatus = await getStatus();
@@ -710,7 +794,7 @@ async function unlockWallet(password) {
     }
   }
 
-  throw new LndError('Lnd is not operational, therefor the wallet cannot be unlocked.');
+  throw new LndError('Lnd is not operational, therefore the wallet cannot be unlocked.');
 }
 
 async function getVersion() {
@@ -723,15 +807,21 @@ async function getVersion() {
   return {version: version}; // eslint-disable-line object-shorthand
 }
 
+function updateChannelPolicy(global, fundingTxid, outputIndex, baseFeeMsat, feeRate, timeLockDelta) {
+  return lndService.updateChannelPolicy(global, fundingTxid, outputIndex, baseFeeMsat, feeRate, timeLockDelta);
+}
+
 module.exports = {
   addInvoice,
-  cancelSendCoinsWhenAvailable,
+  changePassword,
   closeChannel,
   decodePaymentRequest,
+  estimateChannelOpenFee,
   estimateFee,
   generateAddress,
   generateSeed,
   getChannelBalance,
+  getChannelPolicy,
   getChannelCount,
   getInvoices,
   getChannels,
@@ -747,8 +837,8 @@ module.exports = {
   openChannel,
   payInvoice,
   sendCoins,
-  sendCoinsWhenAvailable,
   unlockWallet,
   getGeneralInfo,
   getVersion,
+  updateChannelPolicy,
 };

@@ -77,22 +77,41 @@ async function promiseify(rpcObj, rpcFn, payload, description) {
 }
 
 // an amount, an options memo, and can only be paid to node that created it.
-function addInvoice(amount, memo) {
+async function addInvoice(amount, memo) {
   const rpcPayload = {
     value: amount,
     memo: memo, // eslint-disable-line object-shorthand
     expiry: 3600 // Should we make this ENV specific for ease of testing?
   };
 
-  return initializeRPCClient()
-    .then(({lightning}) => promiseify(lightning, lightning.addInvoice, rpcPayload, 'create new invoice'))
-    .then(grpcResponse => {
-      if (grpcResponse && grpcResponse.paymentRequest) {
-        return grpcResponse.paymentRequest;
-      } else {
-        throw new LndError('Unable to parse invoice from lnd');
-      }
-    });
+  const conn = await initializeRPCClient();
+
+  const grpcResponse = await promiseify(conn.lightning, conn.lightning.addInvoice, rpcPayload, 'create new invoice');
+
+  if (grpcResponse && grpcResponse.paymentRequest) {
+    return {
+      rHash: grpcResponse.rHash,
+      paymentRequest: grpcResponse.paymentRequest,
+    };
+  } else {
+    throw new LndError('Unable to parse invoice from lnd');
+  }
+}
+
+// Change your lnd password. Wallet must exist and be unlocked.
+async function changePassword(currentPassword, newPassword) {
+
+  const currentPasswordBuff = Buffer.from(currentPassword, 'utf8');
+  const newPasswordBuff = Buffer.from(newPassword, 'utf8');
+
+  const rpcPayload = {
+    current_password: currentPasswordBuff,
+    new_password: newPasswordBuff,
+  };
+
+  const conn = await initializeRPCClient();
+
+  return await promiseify(conn.walletUnlocker, conn.walletUnlocker.changePassword, rpcPayload, 'change password');
 }
 
 function closeChannel(fundingTxId, index, force) {
@@ -165,19 +184,20 @@ async function estimateFee(address, amt, confTarget) {
   return await promiseify(conn.lightning, conn.lightning.estimateFee, rpcPayload, 'estimate fee request');
 }
 
-function generateAddress() {
+async function generateAddress() {
   const rpcPayload = {
     type: 1
   };
 
-  return initializeRPCClient()
-    .then(({lightning}) => promiseify(lightning, lightning.NewAddress, rpcPayload, 'generate address'));
+  const conn = await initializeRPCClient();
+
+  return await promiseify(conn.lightning, conn.lightning.NewAddress, rpcPayload, 'generate address');
 }
 
 function generateSeed() {
   return initializeRPCClient().then(({walletUnlocker, state}) => {
     if (state === true) {
-      throw new LndError('Macaroon exists, therefor wallet already exists');
+      throw new LndError('Macaroon exists, therefore wallet already exists');
     }
 
     return promiseify(walletUnlocker, walletUnlocker.GenSeed, {}, 'generate seed');
@@ -187,6 +207,11 @@ function generateSeed() {
 function getChannelBalance() {
   return initializeRPCClient()
     .then(({lightning}) => promiseify(lightning, lightning.ChannelBalance, {}, 'get channel balance'));
+}
+
+function getFeeReport() {
+  return initializeRPCClient()
+    .then(({lightning}) => promiseify(lightning, lightning.FeeReport, {}, 'get fee report'));
 }
 
 function getForwardingEvents(startTime, endTime, indexOffset) {
@@ -263,7 +288,7 @@ function initWallet(options) {
 
   return initializeRPCClient().then(({walletUnlocker, state}) => {
     if (state === true) {
-      throw new LndError('Macaroon exists, therefor wallet already exists');
+      throw new LndError('Macaroon exists, therefore wallet already exists');
     }
 
     return promiseify(walletUnlocker, walletUnlocker.InitWallet, rpcPayload, 'initialize wallet')
@@ -291,7 +316,7 @@ function getOnChainTransactions() {
 
 async function listUnspent() {
   const rpcPayload = {
-    min_confs: 0,
+    min_confs: 1,
     max_confs: 10000000, // Use arbitrarily high maximum confirmation limit.
   };
 
@@ -336,7 +361,7 @@ function sendCoins(addr, amt, satPerByte, sendAll) {
 function sendPaymentSync(paymentRequest, amt) {
   const rpcPayload = {
     payment_request: paymentRequest,
-    amt: amt,
+    amt: amt, // eslint-disable-line object-shorthand
   };
 
   return initializeRPCClient()
@@ -364,14 +389,37 @@ function unlockWallet(password) {
     .then(({walletUnlocker}) => promiseify(walletUnlocker, walletUnlocker.UnlockWallet, rpcPayload, 'unlock wallet'));
 }
 
+function updateChannelPolicy(global, fundingTxid, outputIndex, baseFeeMsat, feeRate, timeLockDelta) {
+  const rpcPayload = {
+    base_fee_msat: baseFeeMsat,
+    fee_rate: feeRate,
+    time_lock_delta: timeLockDelta,
+  };
+
+  if (global) {
+    rpcPayload.global = global;
+  } else {
+    rpcPayload.chan_point = {
+      funding_txid_str: fundingTxid,
+      output_index: outputIndex,
+    };
+  }
+
+  return initializeRPCClient()
+    .then(({lightning}) => promiseify(lightning, lightning.UpdateChannelPolicy, rpcPayload,
+      'update channel policy coins'));
+}
+
 module.exports = {
   addInvoice,
+  changePassword,
   closeChannel,
   connectToPeer,
   decodePaymentRequest,
   estimateFee,
   getChannelBalance,
   getClosedChannels,
+  getFeeReport,
   getForwardingEvents,
   getInfo,
   getInvoices,
@@ -389,4 +437,5 @@ module.exports = {
   sendCoins,
   sendPaymentSync,
   unlockWallet,
+  updateChannelPolicy,
 };

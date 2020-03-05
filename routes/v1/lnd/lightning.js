@@ -6,20 +6,20 @@ const lightningLogic = require('logic/lightning.js');
 const validator = require('utils/validator.js');
 const safeHandler = require('utils/safeHandler');
 
-router.post('/addInvoice', safeHandler((req, res, next) => {
+router.post('/addInvoice', safeHandler(async(req, res, next) => {
 
   const amt = req.body.amt; // Denominated in Satoshi
   const memo = req.body.memo || '';
 
   try {
     validator.isPositiveIntegerOrZero(amt);
-    validator.isAlphanumericAndSpaces(memo);
+    validator.isValidMemoLength(memo);
   } catch (error) {
     return next(error);
   }
 
-  return lightningLogic.addInvoice(amt, memo)
-    .then(invoice => res.json({paymentRequest: invoice}));
+  return await lightningLogic.addInvoice(amt, memo)
+    .then(invoice => res.json(invoice));
 }));
 
 router.get('/forwardingEvents', auth.jwt, safeHandler((req, res, next) => {
